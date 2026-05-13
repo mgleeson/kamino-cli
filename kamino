@@ -1,0 +1,396 @@
+#!/usr/bin/env bash
+################################################################################
+# kamino - bash script to bulk clone git repos supplied in line delimited list
+# @author: Matt Gleeson (https://github.com/mgleeson/kamino-cli)
+# @version: 20260513 - v1.0.0
+# @description: 
+# input:
+#   - accepts a repo list file as positional argument
+#   - accepts repo URLs from stdin by omitting the file argument or using "-".
+#
+# authentication:
+#   - Authentication not handled in script so ssh-agent, ~/.ssh/config,
+#     git credential helpers, SSO tooling, or CI secrets can all work normally.
+#
+# safety:
+#   - clones into temp dir 1st, then mv into destination/target.
+#   - git itself does not read from the repo-list stream, child stdin is /dev/null.
+################################################################################
+
+set -uo pipefail
+
+# -----------------------------
+# Colours & labels
+# -----------------------------
+red=$'\033[01;31m'
+blu=$'\033[01;34m'
+grn=$'\033[01;32m'
+ylw=$'\033[0;33m'
+rst=$'\033[00m'
+spc="      "
+ded="[ ${red}FATAL${rst} ] ${spc}"
+err="[ ${red}ERROR${rst} ] ${spc}"
+nfo="[ ${blu}INFO${rst} ] ${spc}"
+wrn="[ ${ylw}WARN${rst} ] ${spc}"
+ ok="[ ${grn}OK${rst} ] ${spc}"
+fin="[ ${blu}DONE${rst} ] ${spc}"
+
+# -----------------------------
+# Init vars
+# -----------------------------
+SCRIPT_NAME="${0##*/}"
+DEST_DIR="."
+DEST_WAS_SET=0
+REPO_LIST_FILE=""
+INPUT_SOURCE=""
+
+TOTAL=0
+CLONED=0
+SKIPPED=0
+FAILED=0
+
+ACTIVE_TEMP_DIR=""
+declare -a POSITIONAL_ARGS=()
+declare -a FAILURES=()
+
+# -----------------------------
+# Human-facing output helpers
+# -----------------------------
+print_usage() {
+  cat <<USAGE
+Usage:
+  ${SCRIPT_NAME} [-d DEST_DIR] [REPO_LIST_FILE]
+  ${SCRIPT_NAME} [REPO_LIST_FILE] [DEST_DIR]
+  ${SCRIPT_NAME} - [DEST_DIR]
+
+Examples:
+  ${SCRIPT_NAME} repos.txt
+  ${SCRIPT_NAME} repos.txt ~/src/clones
+  ${SCRIPT_NAME} -d ~/src/clones repos.txt
+  cat repos.txt | ${SCRIPT_NAME}
+  cat repos.txt | ${SCRIPT_NAME} -d ~/src/clones
+  cat repos.txt | ${SCRIPT_NAME} - ~/src/clones
+
+Input format:
+  One Git repository URL per line.
+  Blank lines and lines beginning with # are ignored.
+
+Notes:
+  SSH and HTTPS authentication are deliberately handled by the existing Git/SSH
+  environment: ssh-agent, ~/.ssh/config, Git credential helpers, CI secrets, etc.
+USAGE
+}
+
+info() {
+  printf '%s%s\n' "$nfo" "$*"
+}
+
+warn() {
+  printf '%s%s: warning: %s\n' "$wrn" "$SCRIPT_NAME" "$*" >&2
+}
+
+die() {
+  printf '%s%s: error: %s\n' "$ded" "$SCRIPT_NAME" "$*" >&2
+  exit 2
+}
+
+# -----------------------------
+# Cleanup and interruption handling
+# -----------------------------
+
+cleanup_active_temp() {
+  if [[ -n "${ACTIVE_TEMP_DIR:-}" && -d "$ACTIVE_TEMP_DIR" ]]; then
+    rm -rf -- "$ACTIVE_TEMP_DIR"
+  fi
+}
+
+handle_interrupt() {
+  printf '\n%s: interrupted; cleaning up the active temporary clone.\n' "$SCRIPT_NAME" >&2
+  cleanup_active_temp
+  exit 130
+}
+
+trap cleanup_active_temp EXIT
+trap handle_interrupt INT TERM
+
+# -----------------------------
+# Small string utilities
+# -----------------------------
+
+trim() {
+  local s="$1"
+
+  # Keep trimming local and dependency-free; this runs for every input line.
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+
+  printf '%s' "$s"
+}
+
+repo_directory_name() {
+  local url="$1"
+  local s base
+
+  # Derive the same practical directory name a human would expect from common
+  # HTTPS, SSH, scp-style SSH, and local Git paths.
+  s="$(trim "$url")"
+  s="${s%%#*}"
+  s="${s%%\?*}"
+
+  while [[ "$s" == */ ]]; do
+    s="${s%/}"
+  done
+
+  if [[ "$s" == */* ]]; then
+    base="${s##*/}"
+  elif [[ "$s" == *:* ]]; then
+    base="${s##*:}"
+  else
+    base="$s"
+  fi
+
+  base="${base%.git}"
+  printf '%s' "$base"
+}
+
+# -----------------------------
+# Command-line parsing
+# -----------------------------
+
+parse_args() {
+  while (($# > 0)); do
+    case "$1" in
+      -h|--help)
+        print_usage
+        exit 0
+        ;;
+      -d|--dest)
+        shift
+        (($# > 0)) || die "--dest requires a directory argument"
+        DEST_DIR="$1"
+        DEST_WAS_SET=1
+        ;;
+      --dest=*)
+        DEST_DIR="${1#--dest=}"
+        [[ -n "$DEST_DIR" ]] || die "--dest requires a non-empty directory"
+        DEST_WAS_SET=1
+        ;;
+      --)
+        shift
+        while (($# > 0)); do
+          POSITIONAL_ARGS+=("$1")
+          shift
+        done
+        break
+        ;;
+      -)
+        POSITIONAL_ARGS+=("$1")
+        ;;
+      -*)
+        die "unknown option: $1"
+        ;;
+      *)
+        POSITIONAL_ARGS+=("$1")
+        ;;
+    esac
+    shift
+  done
+
+  case "${#POSITIONAL_ARGS[@]}" in
+    0)
+      REPO_LIST_FILE=""
+      ;;
+    1)
+      REPO_LIST_FILE="${POSITIONAL_ARGS[0]}"
+      ;;
+    2)
+      if ((DEST_WAS_SET)); then
+        die "destination supplied twice; use either --dest or the second positional argument"
+      fi
+      REPO_LIST_FILE="${POSITIONAL_ARGS[0]}"
+      DEST_DIR="${POSITIONAL_ARGS[1]}"
+      DEST_WAS_SET=1
+      ;;
+    *)
+      die "too many arguments; see '${SCRIPT_NAME} --help'"
+      ;;
+  esac
+}
+
+# -----------------------------
+# Environment and input validation
+# -----------------------------
+
+check_dependencies() {
+  command -v git >/dev/null 2>&1 || die "git is required but was not found in PATH"
+}
+
+prepare_destination() {
+  mkdir -p -- "$DEST_DIR" || die "could not create destination directory: $DEST_DIR"
+  [[ -d "$DEST_DIR" ]] || die "destination is not a directory: $DEST_DIR"
+  [[ -w "$DEST_DIR" ]] || die "destination is not writable: $DEST_DIR"
+
+  DEST_DIR="$(cd "$DEST_DIR" && pwd -P)" || die "could not resolve destination directory: $DEST_DIR"
+}
+
+prepare_input() {
+  if [[ -z "$REPO_LIST_FILE" || "$REPO_LIST_FILE" == "-" ]]; then
+    [[ ! -t 0 ]] || die "no repo list file supplied and stdin is not piped or redirected"
+    INPUT_SOURCE="stdin"
+    return 0
+  fi
+
+  # This catches a common stdin form typo: 'cat repos.txt | kamino /dest'.
+  # Keep the failure explicit so the one-argument form stays unambiguous.
+  if [[ -d "$REPO_LIST_FILE" && ! -t 0 && "$DEST_WAS_SET" -eq 0 ]]; then
+    die "'$REPO_LIST_FILE' is a directory; when piping input, use '${SCRIPT_NAME} -d <dest>' or '${SCRIPT_NAME} - <dest>'"
+  fi
+
+  [[ -f "$REPO_LIST_FILE" ]] || die "repo list is not a regular file: $REPO_LIST_FILE"
+  [[ -r "$REPO_LIST_FILE" ]] || die "repo list is not readable: $REPO_LIST_FILE"
+
+  INPUT_SOURCE="$REPO_LIST_FILE"
+}
+
+# -----------------------------
+# Clone workflow
+# -----------------------------
+
+record_failure() {
+  local line_no="$1"
+  local repo_url="$2"
+  local reason="$3"
+
+  ((FAILED++))
+  FAILURES+=("line ${line_no}: ${repo_url} -- ${reason}")
+  printf '%sfail: %s\n' "$err" "$reason" >&2
+}
+
+make_temp_dir() {
+  local target_name="$1"
+
+  # Keep temporary clones inside the destination so final rename is cheap and atomic
+  # on normal filesystems.
+  mktemp -d "${DEST_DIR}/.kamino.${target_name}.XXXXXX"
+}
+
+clone_repo() {
+  local repo_url="$1"
+  local line_no="$2"
+  local target_name target_path rc
+
+  ((TOTAL++))
+  target_name="$(repo_directory_name "$repo_url")"
+  target_path="${DEST_DIR}/${target_name}"
+
+  printf '\n%s[%d] clone %s\n' "$nfo" "$TOTAL" "$repo_url"
+
+  if [[ -z "$target_name" || "$target_name" == "." || "$target_name" == ".." ]]; then
+    record_failure "$line_no" "$repo_url" "could not derive a safe clone directory name"
+    return 0
+  fi
+
+  if [[ -e "$target_path" ]]; then
+    ((SKIPPED++))
+    printf '%sskip: target already exists: %s\n' "$wrn" "$target_path" >&2
+    return 0
+  fi
+
+  if ! ACTIVE_TEMP_DIR="$(make_temp_dir "$target_name")"; then
+    record_failure "$line_no" "$repo_url" "could not create a temporary clone directory"
+    return 0
+  fi
+
+  # Protect the repo-list stream from child commands. SSH keys, known_hosts, and
+  # credential helpers should already be set up before this script runs.
+  if git clone -- "$repo_url" "$ACTIVE_TEMP_DIR" < /dev/null; then
+    if mv -- "$ACTIVE_TEMP_DIR" "$target_path"; then
+      ACTIVE_TEMP_DIR=""
+      ((CLONED++))
+      printf '%sok: %s\n' "$ok" "$target_path"
+    else
+      rc=$?
+      cleanup_active_temp
+      ACTIVE_TEMP_DIR=""
+      record_failure "$line_no" "$repo_url" "clone succeeded but rename failed with status ${rc}"
+    fi
+  else
+    rc=$?
+    cleanup_active_temp
+    ACTIVE_TEMP_DIR=""
+    record_failure "$line_no" "$repo_url" "git clone exited with status ${rc}"
+  fi
+}
+
+process_repositories() {
+  local line repo_url
+  local line_no=0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    ((line_no++))
+    line="${line%$'\r'}"
+    repo_url="$(trim "$line")"
+
+    [[ -n "$repo_url" ]] || continue
+    [[ "$repo_url" == \#* ]] && continue
+
+    clone_repo "$repo_url" "$line_no"
+  done
+}
+
+run_from_input() {
+  if [[ "$INPUT_SOURCE" == "stdin" ]]; then
+    process_repositories
+  else
+    process_repositories < "$INPUT_SOURCE"
+  fi
+}
+
+# -----------------------------
+# Result reporting
+# -----------------------------
+
+print_summary() {
+  printf '\n%sSummary\n' "$fin"
+  printf '  source:      %s\n' "$INPUT_SOURCE"
+  printf '  destination: %s\n' "$DEST_DIR"
+  printf '  processed:   %d\n' "$TOTAL"
+  printf '  cloned:      %d\n' "$CLONED"
+  printf '  skipped:     %d\n' "$SKIPPED"
+  printf '  failed:      %d\n' "$FAILED"
+
+  if ((FAILED > 0)); then
+    printf '\nFailures\n' >&2
+    local failure
+    for failure in "${FAILURES[@]}"; do
+      printf '%s- %s\n' "$err" "$failure" >&2
+    done
+  fi
+
+  if ((TOTAL == 0)); then
+    warn "no repository URLs were found in the input"
+  fi
+}
+
+# -----------------------------
+# Main control flow
+# -----------------------------
+
+main() {
+  parse_args "$@"
+  check_dependencies
+  prepare_destination
+  prepare_input
+
+  info "Destination: ${DEST_DIR}"
+  info "Source: ${INPUT_SOURCE}"
+  printf '\n'
+
+  run_from_input
+  print_summary
+
+  ((FAILED == 0))
+}
+
+main "$@"
+
