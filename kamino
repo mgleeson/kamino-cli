@@ -50,6 +50,9 @@ SKIPPED=0
 FAILED=0
 
 ACTIVE_TEMP_DIR=""
+PARSED_REPO_URL=""
+PARSED_TARGET_SUBDIR=""
+PARSE_ERROR=""
 declare -a POSITIONAL_ARGS=()
 declare -a FAILURES=()
 
@@ -73,6 +76,7 @@ Examples:
 
 Input format:
   One Git repository URL per line.
+  Or: Git repository URL, target/subdirectory
   Blank lines and lines beginning with # are ignored.
 
 Notes:
@@ -151,6 +155,77 @@ repo_directory_name() {
 
   base="${base%.git}"
   printf '%s' "$base"
+}
+
+normalize_target_subdir() {
+  local path="$1"
+
+  while [[ "$path" == */ && "$path" != "/" ]]; do
+    path="${path%/}"
+  done
+
+  printf '%s' "$path"
+}
+
+validate_target_subdir() {
+  local target_subdir="$1"
+
+  target_subdir="$(normalize_target_subdir "$target_subdir")"
+
+  if [[ -z "$target_subdir" ]]; then
+    PARSE_ERROR="target subdirectory path is empty"
+    return 1
+  fi
+
+  if [[ "$target_subdir" == "." || "$target_subdir" == ".." ]]; then
+    PARSE_ERROR="target subdirectory path is unsafe: $target_subdir"
+    return 1
+  fi
+
+  if [[ "$target_subdir" == /* ]]; then
+    PARSE_ERROR="target subdirectory path must be relative: $target_subdir"
+    return 1
+  fi
+
+  case "$target_subdir" in
+    ../*|*/../*|*/..)
+      PARSE_ERROR="target subdirectory path contains unsafe '..' segment: $target_subdir"
+      return 1
+      ;;
+  esac
+
+  PARSED_TARGET_SUBDIR="$target_subdir"
+  return 0
+}
+
+parse_repository_line() {
+  local line="$1"
+  local target_subdir
+
+  PARSED_REPO_URL=""
+  PARSED_TARGET_SUBDIR=""
+  PARSE_ERROR=""
+
+  if [[ "$line" != *,* ]]; then
+    PARSED_REPO_URL="$(trim "$line")"
+    return 0
+  fi
+
+  if [[ "$line" == *,*,* ]]; then
+    PARSED_REPO_URL="$(trim "$line")"
+    PARSE_ERROR="line contains more than one comma"
+    return 1
+  fi
+
+  PARSED_REPO_URL="$(trim "${line%%,*}")"
+  target_subdir="$(trim "${line#*,}")"
+
+  if [[ -z "$PARSED_REPO_URL" ]]; then
+    PARSE_ERROR="Git URL is empty"
+    return 1
+  fi
+
+  validate_target_subdir "$target_subdir"
 }
 
 # -----------------------------
@@ -274,14 +349,73 @@ make_temp_dir() {
   mktemp -d "${DEST_DIR}/.kamino.${target_name}.XXXXXX"
 }
 
+prepare_csv_target_parent() {
+  local target_subdir="$1"
+  local target_path="$2"
+  local line_no="$3"
+  local repo_url="$4"
+  local target_parent parent_subdir resolved_parent current segment old_ifs
+  local -a path_segments=()
+
+  target_parent="${target_path%/*}"
+
+  parent_subdir="${target_subdir%/*}"
+  if [[ "$parent_subdir" != "$target_subdir" ]]; then
+    current="$DEST_DIR"
+    old_ifs="$IFS"
+    IFS='/'
+    read -r -a path_segments <<< "$parent_subdir"
+    IFS="$old_ifs"
+
+    for segment in "${path_segments[@]}"; do
+      [[ -n "$segment" && "$segment" != "." ]] || continue
+      current="${current}/${segment}"
+
+      if [[ -L "$current" ]]; then
+        record_failure "$line_no" "$repo_url" "target parent path uses a symbolic link: $current"
+        return 1
+      fi
+    done
+  fi
+
+  if ! mkdir -p -- "$target_parent"; then
+    record_failure "$line_no" "$repo_url" "could not create target parent directory: $target_parent"
+    return 1
+  fi
+
+  if ! resolved_parent="$(cd "$target_parent" && pwd -P)"; then
+    record_failure "$line_no" "$repo_url" "could not resolve target parent directory: $target_parent"
+    return 1
+  fi
+
+  case "$resolved_parent" in
+    "$DEST_DIR"|"$DEST_DIR"/*)
+      return 0
+      ;;
+    *)
+      record_failure "$line_no" "$repo_url" "target parent path resolves outside destination: $target_parent"
+      return 1
+      ;;
+  esac
+}
+
 clone_repo() {
   local repo_url="$1"
   local line_no="$2"
-  local target_name target_path rc
+  local target_subdir="${3:-}"
+  local target_name target_path temp_name rc
 
   ((TOTAL++))
-  target_name="$(repo_directory_name "$repo_url")"
-  target_path="${DEST_DIR}/${target_name}"
+
+  if [[ -n "$target_subdir" ]]; then
+    target_name="${target_subdir##*/}"
+    target_path="${DEST_DIR}/${target_subdir}"
+    temp_name="$target_name"
+  else
+    target_name="$(repo_directory_name "$repo_url")"
+    target_path="${DEST_DIR}/${target_name}"
+    temp_name="$target_name"
+  fi
 
   printf '\n%s[%d] clone %s\n' "$nfo" "$TOTAL" "$repo_url"
 
@@ -296,7 +430,11 @@ clone_repo() {
     return 0
   fi
 
-  if ! ACTIVE_TEMP_DIR="$(make_temp_dir "$target_name")"; then
+  if [[ -n "$target_subdir" ]]; then
+    prepare_csv_target_parent "$target_subdir" "$target_path" "$line_no" "$repo_url" || return 0
+  fi
+
+  if ! ACTIVE_TEMP_DIR="$(make_temp_dir "$temp_name")"; then
     record_failure "$line_no" "$repo_url" "could not create a temporary clone directory"
     return 0
   fi
@@ -334,7 +472,17 @@ process_repositories() {
     [[ -n "$repo_url" ]] || continue
     [[ "$repo_url" == \#* ]] && continue
 
-    clone_repo "$repo_url" "$line_no"
+    if ! parse_repository_line "$repo_url"; then
+      ((TOTAL++))
+      record_failure "$line_no" "${PARSED_REPO_URL:-$repo_url}" "$PARSE_ERROR"
+      continue
+    fi
+
+    if [[ -n "$PARSED_TARGET_SUBDIR" ]]; then
+      clone_repo "$PARSED_REPO_URL" "$line_no" "$PARSED_TARGET_SUBDIR"
+    else
+      clone_repo "$PARSED_REPO_URL" "$line_no"
+    fi
   done
 }
 
@@ -393,4 +541,3 @@ main() {
 }
 
 main "$@"
-
