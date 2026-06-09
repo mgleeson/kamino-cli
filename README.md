@@ -1,5 +1,7 @@
 # kamino-cli
 
+## v2.0.0
+
 `kamino` is a small Bash utility for bulk cloning Git repositories from a line-delimited list.
 
 It accepts repository URLs from either a text file or standard input, then clones each repository into a destination directory.
@@ -9,6 +11,7 @@ The script supports both HTTPS and SSH Git repository URLs. Authentication is in
 ## Features
 
 - Clone multiple Git repositories from a plain text list
+- Optionally clone repositories into list-defined relative subdirectories
 - Accept input from a file or from stdin
 - Support HTTPS and SSH repository URLs
 - Support a configurable destination directory
@@ -121,6 +124,23 @@ ssh://git@example.com/example/project-three.git
 
 Both HTTPS and SSH-style repository URLs are supported.
 
+Optionally, a line may use a simple two-field CSV-style format:
+
+```text
+Git repository URL, target/subdirectory
+```
+
+Example:
+
+```text
+https://github.com/example/moodle-mod_forum.git, mod/forum
+https://github.com/example/moodle-block_demo.git, block/demo/
+```
+
+CSV-style target paths are relative to the destination directory. They must not be absolute paths, empty paths, `.` or `..`, or contain `..` path traversal segments.
+
+This is a simple comma-separated format only. Lines with more than one comma are rejected.
+
 ## Destination directory behavior
 
 If no destination directory is supplied, `kamino` clones repositories into the current working directory.
@@ -139,6 +159,20 @@ will be cloned into:
 
 ```text
 project-one
+```
+
+If a repository list line supplies a CSV-style target path, that repository is cloned into that relative path under the destination directory instead. Parent directories are created as needed.
+
+For example:
+
+```text
+https://github.com/example/moodle-mod_forum.git, mod/forum
+```
+
+will be cloned into:
+
+```text
+mod/forum
 ```
 
 If the target directory already exists, the repository is skipped rather than overwritten.
@@ -224,7 +258,7 @@ It does not currently:
 * clone in parallel
 * validate repository URLs before cloning
 * manage SSH keys or HTTPS credentials
-* support per-repository custom target names
+* support quoted CSV fields or commas inside repository-list fields
 
 Existing directories are skipped rather than modified.
 
@@ -286,4 +320,3 @@ Remove, rename, or move the existing directory before running `kamino` again if 
 ## License
 
 This script is licenced under the GNU Affero General Public License v3.0
-
