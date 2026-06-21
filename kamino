@@ -2,7 +2,7 @@
 ################################################################################
 # kamino - bash script to bulk clone git repos supplied in line delimited list
 # @author: Matt Gleeson (https://github.com/mgleeson/kamino-cli)
-# @version: 20260513 - v1.0.0
+# @version: 20260609 - v2.0.0
 # @description: 
 # input:
 #   - accepts a repo list file as positional argument

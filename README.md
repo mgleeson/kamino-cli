@@ -1,5 +1,7 @@
 # kamino-cli
 
+## v2.0.0
+
 `kamino` is a small Bash utility for bulk cloning Git repositories from a line-delimited list.
 
 It accepts repository URLs from either a text file or standard input, then clones each repository into a destination directory.
